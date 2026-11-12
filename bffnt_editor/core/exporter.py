@@ -8,8 +8,11 @@ character mappings and font information.
 import json
 import os
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from PIL import Image
+
+if TYPE_CHECKING:
+    from ..texture.decoder import SwizzleMode
 
 from .parser import (
     BFFNTFile, TGLP, CWDH, CMAP, CMAPType, CMAPDirect, CMAPTable, CMAPScan,
@@ -353,7 +356,8 @@ def update_bffnt_glyph_width(bffnt: BFFNTFile, glyph_index: int,
 
 
 def apply_imported_sheets(bffnt: BFFNTFile, sheets: List[Image.Image],
-                          original_sheets: Optional[List[Image.Image]] = None) -> bytes:
+                          original_sheets: Optional[List[Image.Image]] = None,
+                          swizzle_mode: Optional["SwizzleMode"] = None) -> bytes:
     """
     Apply imported sheets to a BFFNT file and return modified BNTX data.
     
@@ -376,9 +380,16 @@ def apply_imported_sheets(bffnt: BFFNTFile, sheets: List[Image.Image],
         New BNTX texture data to replace in BFFNT
     """
     import struct
+    from ..texture.decoder import (
+        SwizzleMode, get_switch2_block_height, parse_bntx,
+        swap_switch2_gob_sectors,
+    )
     from ..texture.encoder import encode_rgba_to_bc4, swizzle_block_linear
     from PIL import Image
-    
+
+    if swizzle_mode is None:
+        swizzle_mode = SwizzleMode.SWITCH
+
     # Get the original BNTX data
     original_bntx = b''.join(bffnt.tglp.sheet_data)
     
@@ -386,7 +397,9 @@ def apply_imported_sheets(bffnt: BFFNTFile, sheets: List[Image.Image],
     if original_bntx[:4] != b'BNTX':
         from ..texture.encoder import encode_sheets_for_bffnt
         format_code = 0x1D01  # BC4 by default
-        bntx_data, sheet_size = encode_sheets_for_bffnt(sheets, format_code)
+        bntx_data, sheet_size = encode_sheets_for_bffnt(
+            sheets, format_code, swizzle_mode
+        )
         return bntx_data
     
     # Find the texture data region in the original BNTX
@@ -394,8 +407,12 @@ def apply_imported_sheets(bffnt: BFFNTFile, sheets: List[Image.Image],
     if brtd_offset < 0:
         from ..texture.encoder import encode_sheets_for_bffnt
         format_code = 0x1D01
-        bntx_data, sheet_size = encode_sheets_for_bffnt(sheets, format_code)
+        bntx_data, sheet_size = encode_sheets_for_bffnt(
+            sheets, format_code, swizzle_mode
+        )
         return bntx_data
+
+    texture = parse_bntx(original_bntx)[0]
     
     # BRTD header is 16 bytes, texture data follows
     data_start = brtd_offset + 16
@@ -437,14 +454,29 @@ def apply_imported_sheets(bffnt: BFFNTFile, sheets: List[Image.Image],
             flipped = sheet.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
             width, height = sheet.size
             # Detect original texture format from BNTX BRTI header
-            brti_off = original_bntx.find(b'BRTI')
-            orig_format = struct.unpack_from('<I', original_bntx, brti_off + 0x1C)[0] if brti_off >= 0 else 0x1D01
+            orig_format = texture.format
             if orig_format in (0x0201,):  # R4G4/A8 — 1 byte per pixel
                 linear_data = bytes(flipped.convert('RGBA').split()[3].tobytes())
-                swizzled = swizzle_block_linear(width, height, 1, 1, 1, linear_data)
+                swizzled = swizzle_block_linear(
+                    width, height, 1, 1, 1, linear_data,
+                    block_height_override=(
+                        get_switch2_block_height(texture.size_range)
+                        if swizzle_mode is SwizzleMode.SWITCH2 else None
+                    ),
+                    byte_coordinates=swizzle_mode is SwizzleMode.SWITCH2,
+                )
             else:  # BC4 default
                 bc4_data = encode_rgba_to_bc4(flipped)
-                swizzled = swizzle_block_linear(width, height, 4, 4, 8, bc4_data)
+                swizzled = swizzle_block_linear(
+                    width, height, 4, 4, 8, bc4_data,
+                    block_height_override=(
+                        get_switch2_block_height(texture.size_range)
+                        if swizzle_mode is SwizzleMode.SWITCH2 else None
+                    ),
+                    byte_coordinates=swizzle_mode is SwizzleMode.SWITCH2,
+                )
+            if swizzle_mode is SwizzleMode.SWITCH2 and texture.tile_mode != 1:
+                swizzled = swap_switch2_gob_sectors(swizzled)
             if len(swizzled) < expected_per_sheet:
                 swizzled = swizzled + bytes(expected_per_sheet - len(swizzled))
             elif len(swizzled) > expected_per_sheet:

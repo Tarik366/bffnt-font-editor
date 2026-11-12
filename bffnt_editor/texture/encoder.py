@@ -7,12 +7,13 @@ with proper block-linear swizzling.
 
 import struct
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from PIL import Image
 
 from .decoder import (
     div_round_up, round_up, pow2_round_up, calculate_block_height,
-    get_addr_block_linear, get_format_info
+    get_addr_block_linear, get_addr_block_linear_byte, get_format_info,
+    get_switch2_block_height, swap_switch2_gob_sectors, SwizzleMode,
 )
 
 
@@ -157,7 +158,9 @@ def encode_rgba_to_bc4(image: Image.Image) -> bytes:
 # ============================================================================
 
 def swizzle_block_linear(width: int, height: int, blk_width: int, blk_height: int,
-                         bpp: int, data: bytes) -> bytes:
+                         bpp: int, data: bytes,
+                         block_height_override: Optional[int] = None,
+                         byte_coordinates: bool = False) -> bytes:
     """
     Swizzle linear data to block-linear tiled format.
     
@@ -170,6 +173,8 @@ def swizzle_block_linear(width: int, height: int, blk_width: int, blk_height: in
         blk_height: Block height (1 for uncompressed, 4 for BCn)
         bpp: Bytes per pixel/block
         data: Linear texture data
+        block_height_override: Use an explicit GOB block height when provided
+        byte_coordinates: Tile one byte coordinate at a time instead of whole blocks
         
     Returns:
         Swizzled data suitable for Switch GPU
@@ -178,29 +183,43 @@ def swizzle_block_linear(width: int, height: int, blk_width: int, blk_height: in
     width_in_blocks = div_round_up(width, blk_width)
     height_in_blocks = div_round_up(height, blk_height)
     
-    # Calculate the correct block height for this texture
-    gob_block_height = calculate_block_height(height_in_blocks)
+    gob_block_height = (
+        block_height_override
+        if block_height_override is not None
+        else calculate_block_height(height_in_blocks)
+    )
     
-    # Calculate required buffer size with proper alignment
-    # GOBs are 512 bytes, we need proper padding
-    image_width_in_gobs = div_round_up(width_in_blocks * bpp, 64)
+    width_in_bytes = width_in_blocks * bpp
+    image_width_in_gobs = div_round_up(width_in_bytes, 64)
     height_in_gob_blocks = div_round_up(height_in_blocks, 8 * gob_block_height)
     
     swizzled_size = image_width_in_gobs * height_in_gob_blocks * 512 * gob_block_height
     
-    # Ensure we have enough space
-    linear_size = width_in_blocks * height_in_blocks * bpp
+    linear_size = width_in_bytes * height_in_blocks
     swizzled_size = max(swizzled_size, linear_size)
     
     result = bytearray(swizzled_size)
     
-    for y in range(height_in_blocks):
-        for x in range(width_in_blocks):
-            pos_linear = (y * width_in_blocks + x) * bpp
-            pos = get_addr_block_linear(x, y, width_in_blocks, bpp, 0, gob_block_height)
-            
-            if pos_linear + bpp <= len(data) and pos + bpp <= swizzled_size:
-                result[pos:pos + bpp] = data[pos_linear:pos_linear + bpp]
+    if byte_coordinates:
+        for y in range(height_in_blocks):
+            row_offset = y * width_in_bytes
+            for x_bytes in range(width_in_bytes):
+                tiled_address = get_addr_block_linear_byte(
+                    x_bytes, y, width_in_bytes, 0, gob_block_height
+                )
+                if row_offset + x_bytes < len(data) and tiled_address < swizzled_size:
+                    result[tiled_address] = data[row_offset + x_bytes]
+    else:
+        for y in range(height_in_blocks):
+            for x in range(width_in_blocks):
+                linear_address = (y * width_in_blocks + x) * bpp
+                tiled_address = get_addr_block_linear(
+                    x, y, width_in_blocks, bpp, 0, gob_block_height
+                )
+                if linear_address + bpp <= len(data) and tiled_address + bpp <= swizzled_size:
+                    result[tiled_address:tiled_address + bpp] = (
+                        data[linear_address:linear_address + bpp]
+                    )
     
     return bytes(result)
 
@@ -218,6 +237,7 @@ class BNTXBuildParams:
     format_code: int = 0x1D01  # BC4 UNORM
     array_count: int = 1
     alignment: int = 512
+    swizzle_mode: SwizzleMode = SwizzleMode.SWITCH
 
 
 def build_bntx(sheets: List[Image.Image], params: BNTXBuildParams = None) -> bytes:
@@ -245,6 +265,8 @@ def build_bntx(sheets: List[Image.Image], params: BNTXBuildParams = None) -> byt
     
     # Get format info
     bpp, blk_width, blk_height = get_format_info(params.format_code)
+    height_in_blocks = div_round_up(height, blk_height)
+    gob_block_height = calculate_block_height(height_in_blocks)
     
     # Encode all sheets
     encoded_sheets = []
@@ -259,7 +281,13 @@ def build_bntx(sheets: List[Image.Image], params: BNTXBuildParams = None) -> byt
             linear_data = encode_rgba_to_bc4(flipped)
         
         # Swizzle
-        swizzled = swizzle_block_linear(width, height, blk_width, blk_height, bpp, linear_data)
+        swizzled = swizzle_block_linear(
+            width, height, blk_width, blk_height, bpp, linear_data,
+            block_height_override=gob_block_height,
+            byte_coordinates=params.swizzle_mode is SwizzleMode.SWITCH2,
+        )
+        if params.swizzle_mode is SwizzleMode.SWITCH2:
+            swizzled = swap_switch2_gob_sectors(swizzled)
         encoded_sheets.append(swizzled)
     
     # Calculate sizes
@@ -324,13 +352,11 @@ def build_bntx(sheets: List[Image.Image], params: BNTXBuildParams = None) -> byt
     result[brti_offset+0x2C:brti_offset+0x30] = struct.pack('<I', 1)  # Depth
     result[brti_offset+0x30:brti_offset+0x34] = struct.pack('<I', params.array_count)  # Array count
     
-    # Texture layout - block height encoded in bits 0-2
+    # BNTX block height is stored as log2 at BRTI +0x34.
     block_height_log2 = 0
-    height_in_blocks = div_round_up(height, blk_height)
-    gob_block_height = calculate_block_height(height_in_blocks)
     while (1 << block_height_log2) < gob_block_height and block_height_log2 < 4:
         block_height_log2 += 1
-    result[brti_offset+0x38:brti_offset+0x3C] = struct.pack('<I', block_height_log2)
+    result[brti_offset+0x34:brti_offset+0x38] = struct.pack('<I', block_height_log2)
     
     # Image size and alignment
     result[brti_offset+0x50:brti_offset+0x54] = struct.pack('<I', sheet_size)
@@ -359,18 +385,26 @@ def build_bntx(sheets: List[Image.Image], params: BNTXBuildParams = None) -> byt
     return bytes(result)
 
 
-def encode_sheets_for_bffnt(sheets: List[Image.Image], texture_format: int = 0x1D01) -> Tuple[bytes, int]:
+def encode_sheets_for_bffnt(
+    sheets: List[Image.Image],
+    texture_format: int = 0x1D01,
+    swizzle_mode: SwizzleMode = SwizzleMode.SWITCH,
+) -> Tuple[bytes, int]:
     """
     Encode sheet images for embedding in BFFNT.
     
     Args:
         sheets: List of PIL Images
         texture_format: BNTX format code (default BC4 UNORM)
+        swizzle_mode: Swizzle implementation to use for the generated BNTX
         
     Returns:
         Tuple of (BNTX bytes, sheet size)
     """
-    params = BNTXBuildParams(format_code=texture_format)
+    params = BNTXBuildParams(
+        format_code=texture_format,
+        swizzle_mode=swizzle_mode,
+    )
     bntx_data = build_bntx(sheets, params)
     
     # Calculate individual sheet size for TGLP

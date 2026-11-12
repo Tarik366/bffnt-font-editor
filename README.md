@@ -1,6 +1,6 @@
 # BFFNT Font Editor v1.5.0
 
-A modern Python tool for viewing and editing Nintendo Switch `.bffnt` font files.
+A modern Python tool for viewing and editing Nintendo Switch and Switch 2 `.bffnt` font files.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
@@ -9,7 +9,7 @@ A modern Python tool for viewing and editing Nintendo Switch `.bffnt` font files
 ## ✨ Features
 
 ### 📂 Open & Save
-- Open `.bffnt` font files (Nintendo Switch)
+- Open `.bffnt` font files (Nintendo Switch and Switch 2)
 - Save modifications back to BFFNT format
 
 ### 📄 Texture Sheet Viewer
@@ -25,6 +25,11 @@ A modern Python tool for viewing and editing Nintendo Switch `.bffnt` font files
 ### 📥 Import
 - Import modified texture sheets (PNG)
 - Supports BC4 texture compression
+
+### 🎮 Texture Layout
+- Choose Nintendo Switch or Nintendo Switch 2 swizzling from **File > Texture Swizzle Mode**
+- Nintendo Switch remains the default; Switch 2 uses byte-coordinate GOB tiling, swaps desktop-layout GOB sectors, and reads BNTX block-height log2 from BRTI +0x34
+- **NOTE**: This Feature added by AI and *must be* tested more to be merged
 
 ### 🔤 Character Grid
 - View all glyphs in organized grid

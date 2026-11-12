@@ -6,6 +6,7 @@ For Nintendo Switch (NX) platform, BFFNT files contain embedded BNTX textures.
 
 import struct
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, Tuple
 from PIL import Image
 
@@ -17,6 +18,30 @@ except ImportError:
     HAS_NUMPY = False
 
 from ..core.parser import BFFNTFile, TGLP, TextureFormat, PlatformType
+
+
+class SwizzleMode(Enum):
+    """Texture swizzling layouts supported by the editor."""
+
+    SWITCH = "switch"
+    SWITCH2 = "switch2"
+
+
+def get_switch2_block_height(block_height_log2: int) -> int:
+    """Convert the BNTX block-height log2 field to its GOB height."""
+    if not 0 <= block_height_log2 <= 4:
+        raise ValueError(f"Unsupported BNTX block height: {block_height_log2}")
+    return 1 << block_height_log2
+
+
+def swap_switch2_gob_sectors(data: bytes) -> bytes:
+    """Swap address bits 5 and 6 in each 128-byte desktop-layout sector group."""
+    result = bytearray(data)
+    for offset in range(0, len(result) - 127, 128):
+        first_sector = result[offset + 32:offset + 64]
+        result[offset + 32:offset + 64] = result[offset + 64:offset + 96]
+        result[offset + 64:offset + 96] = first_sector
+    return bytes(result)
 
 
 # ============================================================================
@@ -31,7 +56,7 @@ class BNTXTexture:
     height: int
     format: int
     tile_mode: int
-    size_range: int  # Block height log2
+    size_range: int  # BRTI block-height log2
     alignment: int
     num_mips: int
     data: bytes
@@ -72,7 +97,8 @@ def parse_bntx(data: bytes) -> List[BNTXTexture]:
     # 0x28: Height (4 bytes)
     # 0x2C: Depth (4 bytes)
     # 0x30: Array Count (4 bytes)
-    # 0x38: Texture Layout (4 bytes) - contains block height in bits 0-2
+    # 0x34: Block height log2 (4 bytes)
+    # 0x38: Reserved (4 bytes)
     # 0x50: Image Size (4 bytes)
     # 0x54: Alignment (4 bytes)
     
@@ -85,9 +111,8 @@ def parse_bntx(data: bytes) -> List[BNTXTexture]:
     depth = struct.unpack_from(e + 'I', brti, 0x2C)[0]
     array_count = struct.unpack_from(e + 'I', brti, 0x30)[0]
     
-    tex_layout = struct.unpack_from(e + 'I', brti, 0x38)[0]
-    size_range = tex_layout & 0x7
-    
+    size_range = struct.unpack_from(e + 'I', brti, 0x34)[0]
+
     image_size = struct.unpack_from(e + 'I', brti, 0x50)[0]
     alignment = struct.unpack_from(e + 'I', brti, 0x54)[0]
     
@@ -169,32 +194,41 @@ def calculate_block_height(height_in_blocks: int) -> int:
     return block_height
 
 
-def get_addr_block_linear(x: int, y: int, image_width: int, bytes_per_pixel: int, 
-                          base_address: int, block_height: int) -> int:
+def get_addr_block_linear_byte(x_bytes: int, y: int, image_width_bytes: int,
+                               base_address: int, block_height: int) -> int:
     """
-    Calculate address for block-linear tiling (from Tegra X1 TRM).
+    Calculate the tiled address of a byte coordinate (from Tegra X1 TRM).
     """
-    image_width_in_gobs = div_round_up(image_width * bytes_per_pixel, 64)
-    
+    image_width_in_gobs = div_round_up(image_width_bytes, 64)
+
     gob_address = (base_address
                    + (y // (8 * block_height)) * 512 * block_height * image_width_in_gobs
-                   + (x * bytes_per_pixel // 64) * 512 * block_height
+                   + (x_bytes // 64) * 512 * block_height
                    + (y % (8 * block_height) // 8) * 512)
-    
-    x_bytes = x * bytes_per_pixel
-    
-    address = (gob_address 
+
+    return (gob_address
                + ((x_bytes % 64) // 32) * 256 
                + ((y % 8) // 2) * 64
                + ((x_bytes % 32) // 16) * 32 
                + (y % 2) * 16 
                + (x_bytes % 16))
-    
-    return address
+
+
+def get_addr_block_linear(x: int, y: int, image_width: int, bytes_per_pixel: int,
+                          base_address: int, block_height: int) -> int:
+    """Compatibility wrapper for callers that address whole pixels or blocks."""
+    return get_addr_block_linear_byte(
+        x * bytes_per_pixel,
+        y,
+        image_width * bytes_per_pixel,
+        base_address,
+        block_height,
+    )
 
 
 def deswizzle_block_linear(width: int, height: int, blk_width: int, blk_height: int,
-                           bpp: int, data: bytes, block_height_override: int = None) -> bytes:
+                           bpp: int, data: bytes, block_height_override: int = None,
+                           byte_coordinates: bool = False) -> bytes:
     """
     Deswizzle block-linear tiled data.
     
@@ -206,6 +240,7 @@ def deswizzle_block_linear(width: int, height: int, blk_width: int, blk_height: 
         bpp: Bytes per pixel/block
         data: Raw texture data
         block_height_override: If provided, use this block height instead of calculating
+        byte_coordinates: Untile one byte coordinate at a time instead of whole blocks
         
     Returns:
         Deswizzled data
@@ -221,16 +256,30 @@ def deswizzle_block_linear(width: int, height: int, blk_width: int, blk_height: 
         # Calculate the correct block height for this texture
         gob_block_height = calculate_block_height(height_in_blocks)
     
-    linear_size = width_in_blocks * height_in_blocks * bpp
+    width_in_bytes = width_in_blocks * bpp
+    linear_size = width_in_bytes * height_in_blocks
     result = bytearray(linear_size)
     
-    for y in range(height_in_blocks):
-        for x in range(width_in_blocks):
-            pos = get_addr_block_linear(x, y, width_in_blocks, bpp, 0, gob_block_height)
-            pos_linear = (y * width_in_blocks + x) * bpp
-            
-            if pos + bpp <= len(data) and pos_linear + bpp <= linear_size:
-                result[pos_linear:pos_linear + bpp] = data[pos:pos + bpp]
+    if byte_coordinates:
+        for y in range(height_in_blocks):
+            row_offset = y * width_in_bytes
+            for x_bytes in range(width_in_bytes):
+                tiled_address = get_addr_block_linear_byte(
+                    x_bytes, y, width_in_bytes, 0, gob_block_height
+                )
+                if tiled_address < len(data):
+                    result[row_offset + x_bytes] = data[tiled_address]
+    else:
+        for y in range(height_in_blocks):
+            for x in range(width_in_blocks):
+                tiled_address = get_addr_block_linear(
+                    x, y, width_in_blocks, bpp, 0, gob_block_height
+                )
+                linear_address = (y * width_in_blocks + x) * bpp
+                if tiled_address + bpp <= len(data):
+                    result[linear_address:linear_address + bpp] = (
+                        data[tiled_address:tiled_address + bpp]
+                    )
     
     return bytes(result)
 
@@ -418,7 +467,11 @@ def get_format_info(format_code: int) -> Tuple[int, int, int]:
 # Main Decoding Functions
 # ============================================================================
 
-def decode_bntx_sheet(tex: BNTXTexture, sheet_index: int) -> Image.Image:
+def decode_bntx_sheet(
+    tex: BNTXTexture,
+    sheet_index: int,
+    swizzle_mode: SwizzleMode = SwizzleMode.SWITCH,
+) -> Image.Image:
     """
     Decode a single texture sheet from BNTX data.
     """
@@ -448,15 +501,21 @@ def decode_bntx_sheet(tex: BNTXTexture, sheet_index: int) -> Image.Image:
         sheet_data = tex.data[data_start:] + bytes(data_end - len(tex.data))
     else:
         sheet_data = tex.data[data_start:data_end]
-    
-    # Deswizzle (always use block-linear for Switch textures)
-    # Note: We use automatic block height calculation, not the size_range from BNTX
-    # because size_range often contains other info or is incorrectly parsed
+
+    if swizzle_mode is SwizzleMode.SWITCH2 and tex.tile_mode != 1:
+        sheet_data = swap_switch2_gob_sectors(sheet_data)
+
+    block_height_override = None
+    if swizzle_mode is SwizzleMode.SWITCH2:
+        block_height_override = get_switch2_block_height(tex.size_range)
+
     deswizzled = deswizzle_block_linear(
         tex.width, tex.height,
         blk_width, blk_height,
         bpp,
-        sheet_data
+        sheet_data,
+        block_height_override=block_height_override,
+        byte_coordinates=swizzle_mode is SwizzleMode.SWITCH2,
     )
     
     # Decode to RGBA
@@ -486,7 +545,10 @@ def decode_bntx_sheet(tex: BNTXTexture, sheet_index: int) -> Image.Image:
     return image
 
 
-def decode_all_sheets(bffnt: BFFNTFile) -> List[Image.Image]:
+def decode_all_sheets(
+    bffnt: BFFNTFile,
+    swizzle_mode: SwizzleMode = SwizzleMode.SWITCH,
+) -> List[Image.Image]:
     """
     Decode all texture sheets from a BFFNT file.
     """
@@ -508,10 +570,9 @@ def decode_all_sheets(bffnt: BFFNTFile) -> List[Image.Image]:
             # Decode each sheet in the texture array
             # Use array_count from BNTX which contains the actual number of texture layers
             num_sheets = tex.array_count if tex.array_count > 1 else 1
-            
             for i in range(num_sheets):
                 try:
-                    sheet = decode_bntx_sheet(tex, i)
+                    sheet = decode_bntx_sheet(tex, i, swizzle_mode)
                     sheets.append(sheet)
                 except Exception as e:
                     print(f"Failed to decode sheet {i}: {e}")

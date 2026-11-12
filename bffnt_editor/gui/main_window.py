@@ -50,13 +50,13 @@ from PyQt6.QtWidgets import (
     QProgressBar, QDialog, QInputDialog
 )
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon, QPixmap, QFont, QPalette, QColor
+from PyQt6.QtGui import QAction, QActionGroup, QIcon, QPixmap, QFont, QPalette, QColor
 from PIL import Image
 
 logger.info("PyQt6 and PIL imports successful")
 
 from ..core.parser import BFFNTFile, parse_bffnt, TextureFormat
-from ..texture.decoder import decode_all_sheets, extract_all_glyphs
+from ..texture.decoder import SwizzleMode, decode_all_sheets, extract_all_glyphs
 from ..core.exporter import export_font, import_sheets, apply_imported_sheets
 from ..core.writer import save_bffnt, update_bffnt_textures
 from ..i18n import tr, set_language, get_language, get_available_languages
@@ -73,9 +73,14 @@ class FontLoadWorker(QThread):
     finished = pyqtSignal(object, list, list, list)  # bffnt, sheets, sheet_pixmaps, glyph_pixmaps
     error = pyqtSignal(str)  # error message
     
-    def __init__(self, file_path: str):
+    def __init__(
+        self,
+        file_path: str,
+        swizzle_mode: SwizzleMode = SwizzleMode.SWITCH,
+    ):
         super().__init__()
         self.file_path = file_path
+        self.swizzle_mode = swizzle_mode
     
     def run(self):
         try:
@@ -85,7 +90,7 @@ class FontLoadWorker(QThread):
             
             # Decode textures
             self.progress.emit("Decoding texture sheets...", 30)
-            sheets = decode_all_sheets(bffnt)
+            sheets = decode_all_sheets(bffnt, self.swizzle_mode)
             
             # Convert sheets to pixmaps (relatively fast)
             self.progress.emit("Converting to display format...", 50)
@@ -147,6 +152,7 @@ class MainWindow(QMainWindow):
         self.file_modified = False
         self.textures_modified = False  # Track if textures need re-encoding
         self.selected_glyph_index: Optional[int] = None
+        self.swizzle_mode = SwizzleMode.SWITCH
         
         self._setup_ui()
         self._setup_menu()
@@ -500,6 +506,26 @@ class MainWindow(QMainWindow):
         self.menu_open.setShortcut("Ctrl+O")
         self.menu_open.triggered.connect(self._open_file)
         self.file_menu.addAction(self.menu_open)
+
+        self.swizzle_menu = self.file_menu.addMenu(tr("menu.swizzle_mode"))
+        self.swizzle_action_group = QActionGroup(self)
+        self.swizzle_action_group.setExclusive(True)
+        self.menu_swizzle_switch = QAction(tr("menu.swizzle_switch"), self)
+        self.menu_swizzle_switch.setCheckable(True)
+        self.menu_swizzle_switch.setChecked(True)
+        self.menu_swizzle_switch.triggered.connect(
+            lambda checked=False: self._set_swizzle_mode(SwizzleMode.SWITCH)
+        )
+        self.swizzle_action_group.addAction(self.menu_swizzle_switch)
+        self.swizzle_menu.addAction(self.menu_swizzle_switch)
+
+        self.menu_swizzle_switch2 = QAction(tr("menu.swizzle_switch2"), self)
+        self.menu_swizzle_switch2.setCheckable(True)
+        self.menu_swizzle_switch2.triggered.connect(
+            lambda checked=False: self._set_swizzle_mode(SwizzleMode.SWITCH2)
+        )
+        self.swizzle_action_group.addAction(self.menu_swizzle_switch2)
+        self.swizzle_menu.addAction(self.menu_swizzle_switch2)
         
         self.file_menu.addSeparator()
         
@@ -595,6 +621,39 @@ class MainWindow(QMainWindow):
             
             # Rebuild menus and toolbar with new language
             self._retranslate_ui()
+
+    def _set_swizzle_mode(self, swizzle_mode: SwizzleMode):
+        """Set the swizzle mode for the active font and reload it if necessary."""
+        if swizzle_mode is self.swizzle_mode:
+            return
+
+        if self.current_file_path and (self.file_modified or self.textures_modified):
+            reply = QMessageBox.question(
+                self,
+                tr("dialog.swizzle_mode_change_title"),
+                tr("dialog.swizzle_mode_change_warning"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self.menu_swizzle_switch.setChecked(
+                    self.swizzle_mode is SwizzleMode.SWITCH
+                )
+                self.menu_swizzle_switch2.setChecked(
+                    self.swizzle_mode is SwizzleMode.SWITCH2
+                )
+                return
+
+        self.swizzle_mode = swizzle_mode
+        self.menu_swizzle_switch.setChecked(
+            swizzle_mode is SwizzleMode.SWITCH
+        )
+        self.menu_swizzle_switch2.setChecked(
+            swizzle_mode is SwizzleMode.SWITCH2
+        )
+
+        if self.current_file_path:
+            self.load_font(self.current_file_path)
     
     def _retranslate_ui(self):
         """Update all UI text with current language translations."""
@@ -613,6 +672,12 @@ class MainWindow(QMainWindow):
             self.edit_menu.setTitle(tr("menu.edit"))
         if hasattr(self, 'view_menu'):
             self.view_menu.setTitle(tr("menu.view"))
+        if hasattr(self, 'swizzle_menu'):
+            self.swizzle_menu.setTitle(tr("menu.swizzle_mode"))
+        if hasattr(self, 'menu_swizzle_switch'):
+            self.menu_swizzle_switch.setText(tr("menu.swizzle_switch"))
+        if hasattr(self, 'menu_swizzle_switch2'):
+            self.menu_swizzle_switch2.setText(tr("menu.swizzle_switch2"))
         
         # Update menu items
         if hasattr(self, 'menu_open'):
@@ -1034,10 +1099,12 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"Loading {os.path.basename(file_path)}...")
         
         # Create and start worker thread
-        self.load_worker = FontLoadWorker(file_path)
+        self.load_worker = FontLoadWorker(file_path, self.swizzle_mode)
         self.load_worker.progress.connect(self._on_load_progress)
         self.load_worker.finished.connect(self._on_load_finished)
         self.load_worker.error.connect(self._on_load_error)
+        self.menu_swizzle_switch.setEnabled(False)
+        self.menu_swizzle_switch2.setEnabled(False)
         self.load_worker.start()
     
     def _on_load_progress(self, message: str, percentage: int):
@@ -1048,6 +1115,8 @@ class MainWindow(QMainWindow):
     
     def _on_load_finished(self, bffnt, sheets, sheet_pixmaps, glyph_pixmaps):
         """Handle loading completion."""
+        self.menu_swizzle_switch.setEnabled(True)
+        self.menu_swizzle_switch2.setEnabled(True)
         logger.info("=" * 50)
         logger.info("FONT LOADED SUCCESSFULLY")
         logger.info("=" * 50)
@@ -1088,6 +1157,8 @@ class MainWindow(QMainWindow):
     
     def _on_load_error(self, error_message: str):
         """Handle loading errors."""
+        self.menu_swizzle_switch.setEnabled(True)
+        self.menu_swizzle_switch2.setEnabled(True)
         logger.error(f"Failed to load font: {error_message}")
         QMessageBox.critical(self, "Error", f"Failed to load font file:\n{error_message}")
         self.status_bar.showMessage("Error loading file")
@@ -1605,7 +1676,11 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Encoding textures...")
             QApplication.processEvents()
             
-            new_bntx_data = apply_imported_sheets(self.bffnt, new_sheets, original_sheets=self.sheets)
+            new_bntx_data = apply_imported_sheets(
+                self.bffnt, new_sheets,
+                original_sheets=self.sheets,
+                swizzle_mode=self.swizzle_mode,
+            )
             update_bffnt_textures(self.bffnt, new_bntx_data, len(new_sheets))
             
             # Update display
@@ -1673,7 +1748,9 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("Encoding textures and saving...")
                 QApplication.processEvents()
                 logger.info(f"Encoding {len(self.sheets)} texture sheets (textures were modified)...")
-                new_bntx_data = apply_imported_sheets(self.bffnt, self.sheets)
+                new_bntx_data = apply_imported_sheets(
+                    self.bffnt, self.sheets, swizzle_mode=self.swizzle_mode
+                )
                 update_bffnt_textures(self.bffnt, new_bntx_data, len(self.sheets))
                 logger.info(f"Encoded BNTX data: {len(new_bntx_data)} bytes")
             else:
@@ -1726,7 +1803,9 @@ class MainWindow(QMainWindow):
                     self.status_bar.showMessage("Encoding textures and saving...")
                     QApplication.processEvents()
                     logger.info(f"Encoding {len(self.sheets)} texture sheets (textures were modified)...")
-                    new_bntx_data = apply_imported_sheets(self.bffnt, self.sheets)
+                    new_bntx_data = apply_imported_sheets(
+                        self.bffnt, self.sheets, swizzle_mode=self.swizzle_mode
+                    )
                     update_bffnt_textures(self.bffnt, new_bntx_data, len(self.sheets))
                     logger.info(f"Encoded BNTX data: {len(new_bntx_data)} bytes")
                 else:

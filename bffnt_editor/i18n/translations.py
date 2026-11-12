@@ -32,6 +32,9 @@ EN = {
         "edit": "&Edit",
         "view": "&View",
         "help": "&Help",
+        "swizzle_mode": "Texture Swizzle Mode",
+        "swizzle_switch": "Nintendo Switch",
+        "swizzle_switch2": "Nintendo Switch 2",
         
         # File menu items
         "open": "&Open...",
@@ -135,6 +138,8 @@ EN = {
     
     # Dialogs
     "dialog": {
+        "swizzle_mode_change_title": "Change Texture Swizzle Mode",
+        "swizzle_mode_change_warning": "Reload the current file using the new mode? Unsaved changes will be discarded.",
         "mapping_editor_title": "Character Mapping Editor",
         "mapping_editor_info": "Edit character mappings below. Double-click a cell to modify.\nChar Code column shows the Unicode code point (decimal).\nGlyph Index shows which glyph texture is displayed for that character.",
         "edit_selected_glyph": "Edit Selected Glyph Mapping",
@@ -211,6 +216,9 @@ PT_BR = {
         "edit": "&Editar",
         "view": "&Visualizar",
         "help": "&Ajuda",
+        "swizzle_mode": "Modo de Swizzle da Textura",
+        "swizzle_switch": "Nintendo Switch",
+        "swizzle_switch2": "Nintendo Switch 2",
         
         # File menu items
         "open": "&Abrir...",
@@ -314,6 +322,8 @@ PT_BR = {
     
     # Dialogs
     "dialog": {
+        "swizzle_mode_change_title": "Alterar Modo de Swizzle",
+        "swizzle_mode_change_warning": "Recarregar o arquivo atual usando o novo modo? As alterações não salvas serão descartadas.",
         "mapping_editor_title": "Editor de Mapeamento de Caracteres",
         "mapping_editor_info": "Edite os mapeamentos abaixo. Clique duplo em uma célula para modificar.\nColuna Código do Char mostra o ponto de código Unicode (decimal).\nÍndice do Glifo mostra qual textura de glifo é exibida para esse caractere.",
         "edit_selected_glyph": "Editar Mapeamento do Glifo Selecionado",
